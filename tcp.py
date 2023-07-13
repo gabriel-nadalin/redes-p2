@@ -54,6 +54,7 @@ class Conexao:
         self.callback = None
         self.seq_no = random.randint(0, 0xffff)
         self.ack_no = seq_no + 1
+        self.fin = False
         src_addr, src_port, dst_addr, dst_port = id_conexao
         self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_SYN + FLAGS_ACK), dst_addr, src_addr), src_addr)
         self.seq_no += 1
@@ -69,7 +70,13 @@ class Conexao:
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        if seq_no == self.ack_no and len(payload) > 0:
+        if (flags & FLAGS_FIN) == FLAGS_FIN:
+            self.callback(self, b'')
+            self.ack_no = seq_no + 1
+            self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK), dst_addr, src_addr), src_addr)
+        elif (flags & FLAGS_ACK) == FLAGS_ACK and self.fin and ack_no == self.seq_no + 1:
+            del self.servidor.conexoes[self.id_conexao]
+        elif seq_no == self.ack_no and len(payload) > 0:
             self.callback(self, payload)
             self.ack_no += len(payload)
             self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK), dst_addr, src_addr), src_addr)
@@ -94,7 +101,7 @@ class Conexao:
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         while len(dados) > 0:
             if len(dados) > MSS:
-                segmento = dados[0:MSS]
+                segmento = dados[:MSS]
                 dados = dados[MSS:]
             else:
                 segmento = dados
@@ -108,4 +115,7 @@ class Conexao:
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+        self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN), dst_addr, src_addr), src_addr)
+        self.fin = True
         pass
