@@ -2,6 +2,8 @@ import asyncio
 from tcputils import *
 import random
 from collections import OrderedDict
+import time
+import math
 
 class Servidor:
     def __init__(self, rede, porta):
@@ -56,24 +58,32 @@ class Conexao:
         self.seq_no = random.randint(0, 0xffff)
         self.ack_no = seq_no + 1
         self.fin = False
-        self.unacked = OrderedDict()
+        self.unacked = b''
+        self.unsent = b''
+        self.estimatedRTT = None
+        self.timeoutInterval = 1
+        self.cwnd = 1
         src_addr, src_port, dst_addr, dst_port = id_conexao
         self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_SYN + FLAGS_ACK), dst_addr, src_addr), src_addr)
         self.seq_no += 1
         self.base_seq = self.seq_no
         self.timer = None
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
 
     def retransmitir(self):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        key = list(self.unacked.keys())[0]
-        self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, key, self.ack_no, FLAGS_ACK) + self.unacked[key], dst_addr, src_addr), src_addr)
+        segmento = self.unacked[:MSS]
+        self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.base_seq, self.ack_no, FLAGS_ACK) + segmento, dst_addr, src_addr), src_addr)
+        self.t0 = None
+        if self.cwnd > 1:
+            self.cwnd = math.ceil(self.cwnd/2)
+        self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de unacked provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
+        self.t1 = time.time()
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.callback(self, b'')
             self.ack_no = seq_no + 1
@@ -82,14 +92,25 @@ class Conexao:
             if self.fin and ack_no == self.seq_no + 1:
                 del self.servidor.conexoes[self.id_conexao]
             elif ack_no > self.base_seq and len(self.unacked) > 0:
-                while len(self.unacked) > 0 and self.base_seq < ack_no:
-                    self.base_seq += len(self.unacked[list(self.unacked.keys())[0]])
-                    del self.unacked[list(self.unacked.keys())[0]]
-                if self.timer != None:
-                    if len(self.unacked) > 0:
-                        self.timer = asyncio.get_event_loop().call_later(1, self.retransmitir)
+                if self.t0 != None:
+                    self.cwnd += 1
+                    self.sampleRTT = self.t1 - self.t0
+                    if self.estimatedRTT == None:
+                        self.estimatedRTT = self.sampleRTT
+                        self.devRTT = self.sampleRTT / 2
                     else:
-                        self.timer.cancel()
+                        self.estimatedRTT = (1 - 0.125) * self.estimatedRTT + 0.125 * self.sampleRTT
+                        self.devRTT = (1 - 0.25) * self.devRTT + 0.25 * abs(self.sampleRTT - self.estimatedRTT)
+                    self.timeoutInterval = self.estimatedRTT + 4 * self.devRTT
+                self.unacked = self.unacked[ack_no - self.base_seq:]
+                self.base_seq = ack_no
+                if len(self.unacked) > 0:
+                    self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
+                else:
+                    self.timer.cancel()
+                    self.timer = None
+                if len(self.unsent) > 0:
+                    self.enviar(b'')
         if seq_no == self.ack_no and len(payload) > 0:
             self.callback(self, payload)
             self.ack_no += len(payload)
@@ -114,13 +135,17 @@ class Conexao:
         # que você construir para a camada de rede.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         self.base_seq = self.seq_no
-        for i in range(0, len(dados), MSS):
-            self.unacked[self.seq_no] = dados[i:i + MSS]
-            self.seq_no += len(dados[i:i + MSS])
-        for key in self.unacked.keys():
-            self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, key, self.ack_no, FLAGS_ACK) + self.unacked[key], dst_addr, src_addr), src_addr)
+        self.unsent += dados
+        for _ in range(0, self.cwnd, 1):
+            if len(self.unsent) > 0:
+                segmento = self.unsent[:MSS]
+                self.unsent = self.unsent[MSS:]
+                self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK) + segmento, dst_addr, src_addr), src_addr)
+                self.unacked += segmento
+                self.seq_no += len(segmento)
+        self.t0 = time.time()
         if self.timer == None:
-            self.timer = asyncio.get_event_loop().call_later(1, self.retransmitir)
+            self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
         pass
 
     def fechar(self):
