@@ -1,7 +1,6 @@
 import asyncio
 from tcputils import *
 import random
-from collections import OrderedDict
 import time
 import math
 
@@ -25,7 +24,7 @@ class Servidor:
             flags, window_size, checksum, urg_ptr = read_header(segment)
 
         if dst_port != self.porta:
-            # Ignora unacked que não são destinados à porta do nosso servidor
+            # Ignora segmentos que não são destinados à porta do nosso servidor
             return
         if not self.rede.ignore_checksum and calc_checksum(segment, src_addr, dst_addr) != 0:
             print('descartando segmento com checksum incorreto')
@@ -74,12 +73,11 @@ class Conexao:
         segmento = self.unacked[:MSS]
         self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.base_seq, self.ack_no, FLAGS_ACK) + segmento, dst_addr, src_addr), src_addr)
         self.t0 = None
-        if self.cwnd > 1:
-            self.cwnd = math.ceil(self.cwnd/2)
+        self.cwnd = math.ceil(self.cwnd/2)
         self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        # TODO: trate aqui o recebimento de unacked provenientes da camada de rede.
+        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
@@ -91,7 +89,8 @@ class Conexao:
         if (flags & FLAGS_ACK) == FLAGS_ACK:
             if self.fin and ack_no == self.seq_no + 1:
                 del self.servidor.conexoes[self.id_conexao]
-            elif ack_no > self.base_seq and len(self.unacked) > 0:
+            elif ack_no > self.base_seq:
+                self.timer.cancel()
                 if self.t0 != None:
                     self.cwnd += 1
                     self.sampleRTT = self.t1 - self.t0
@@ -107,7 +106,6 @@ class Conexao:
                 if len(self.unacked) > 0:
                     self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
                 else:
-                    self.timer.cancel()
                     self.timer = None
                 if len(self.unsent) > 0:
                     self.enviar(b'')
@@ -134,9 +132,8 @@ class Conexao:
         # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
         # que você construir para a camada de rede.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        self.base_seq = self.seq_no
         self.unsent += dados
-        for _ in range(0, self.cwnd, 1):
+        for _ in range(0, self.cwnd):
             if len(self.unsent) > 0:
                 segmento = self.unsent[:MSS]
                 self.unsent = self.unsent[MSS:]
@@ -146,7 +143,6 @@ class Conexao:
         self.t0 = time.time()
         if self.timer == None:
             self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.retransmitir)
-        pass
 
     def fechar(self):
         """
@@ -156,4 +152,3 @@ class Conexao:
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         self.servidor.rede.enviar(fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN), dst_addr, src_addr), src_addr)
         self.fin = True
-        pass
